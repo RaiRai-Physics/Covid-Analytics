@@ -1,0 +1,70 @@
+# Architecture Documentation
+
+## Overview
+This project implements a layered COVID-19 analytics pipeline using a Bronze, Silver, and Gold architecture.
+
+## Layers
+
+### Bronze Layer
+The Bronze layer stores raw datasets copied directly from the AWS COVID-19 public data lake into Amazon S3.
+
+Files used:
+- `bronze/nytimes/us_states.csv`
+- `bronze/covid_tracking/states_daily.csv`
+- `bronze/static/states_abv.csv`
+
+### Silver Layer
+The Silver layer standardizes and cleans Bronze data using AWS Glue and PySpark.
+
+Transformations applied:
+- parse date columns into proper date format
+- standardize state names and state codes
+- cast numeric columns to integer/long types
+- remove invalid/null records for key fields
+- write output as Parquet
+
+Outputs:
+- `silver/cases_standardized/`
+- `silver/testing_standardized/`
+
+### Gold Layer
+The Gold layer builds analytics-ready dimensional and fact tables.
+
+Dimensions:
+- `dim_date`
+- `dim_state`
+
+Facts:
+- `fact_cases_state_daily`
+- `fact_testing_state_daily`
+
+Key calculations:
+- `new_cases`
+- `new_deaths`
+- `new_tests`
+- `positivity_rate`
+
+### Serving Layer
+Snowflake is used as the serving warehouse instead of Redshift.
+
+Gold Parquet outputs are loaded into Snowflake tables using:
+- storage integration
+- external stage
+- file format
+- `COPY INTO`
+
+## Architecture Diagram
+Suggested flow:
+
+AWS Public COVID-19 Data Lake  
+→ S3 Bronze  
+→ AWS Glue Silver Job  
+→ S3 Silver  
+→ AWS Glue Gold Job  
+→ S3 Gold  
+→ Snowflake External Stage  
+→ Snowflake Curated Tables  
+→ SQL Analytics
+
+## Why Snowflake Instead of Redshift
+The project brief originally expected Redshift as the serving warehouse. Since Redshift access was unavailable, Snowflake was used as a compatible cloud data warehouse alternative. This preserved the same star schema and analytics requirements while changing only the serving layer.
