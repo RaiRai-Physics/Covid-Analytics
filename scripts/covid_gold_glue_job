@@ -1,0 +1,188 @@
+import sys
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+# -------------------------------------------------
+# Glue job setup
+# -------------------------------------------------
+args = getResolvedOptions(sys.argv, ["JOB_NAME", "S3_BUCKET"])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args["JOB_NAME"], args)
+
+BUCKET = args["S3_BUCKET"]
+SILVER = f"s3://{BUCKET}/covid/silver"
+GOLD = f"s3://{BUCKET}/covid/gold"
+
+print(f"Reading Silver data from: {SILVER}")
+print(f"Writing Gold data to: {GOLD}")
+
+# -------------------------------------------------
+# Read Silver
+# -------------------------------------------------
+cases = spark.read.parquet(f"{SILVER}/cases_standardized")
+tests = spark.read.parquet(f"{SILVER}/testing_standardized")
+
+print("Silver read complete.")
+print(f"Cases Silver count: {cases.count()}")
+print(f"Tests Silver count: {tests.count()}")
+
+# -------------------------------------------------
+# Basic cleanup 
+# -------------------------------------------------
+cases = (
+    cases
+    .filter(F.col("full_date").isNotNull())
+    .filter(F.col("state_code").isNotNull())
+    .withColumn("state_code", F.upper(F.trim(F.col("state_code"))))
+    .withColumn("state_name", F.initcap(F.trim(F.col("state_name"))))
+    .withColumn("cases_cum", F.coalesce(F.col("cases_cum").cast("long"), F.lit(0)))
+    .withColumn("deaths_cum", F.coalesce(F.col("deaths_cum").cast("long"), F.lit(0)))
+)
+
+tests = (
+    tests
+    .filter(F.col("full_date").isNotNull())
+    .filter(F.col("state_code").isNotNull())
+    .withColumn("state_code", F.upper(F.trim(F.col("state_code"))))
+    .withColumn("state_name", F.initcap(F.trim(F.col("state_name"))))
+    .withColumn("tests_total_cum", F.coalesce(F.col("tests_total_cum").cast("long"), F.lit(0)))
+    .withColumn("tests_pos_cum", F.coalesce(F.col("tests_pos_cum").cast("long"), F.lit(0)))
+    .withColumn("tests_neg_cum", F.coalesce(F.col("tests_neg_cum").cast("long"), F.lit(0)))
+)
+
+# Optional de-dupe safety
+cases = cases.dropDuplicates(["full_date", "state_code"])
+tests = tests.dropDuplicates(["full_date", "state_code"])
+
+# -------------------------------------------------
+# dim_date
+# -------------------------------------------------
+all_dates = (
+    cases.select("full_date")
+    .union(tests.select("full_date"))
+    .dropDuplicates()
+)
+
+dim_date = (
+    all_dates
+    .withColumn("date_id", F.date_format("full_date", "yyyyMMdd").cast("int"))
+    .withColumn("year", F.year("full_date"))
+    .withColumn("month", F.month("full_date"))
+    .withColumn("day", F.dayofmonth("full_date"))
+    # Spark dayofweek: 1=Sunday, 2=Monday, ..., 7=Saturday
+    # Convert to ISO-like numbering: Monday=1, ..., Sunday=7
+    .withColumn("dow", (((F.dayofweek("full_date") + F.lit(5)) % F.lit(7)) + F.lit(1)).cast("int"))
+    .withColumn("is_weekend", F.col("dow").isin([6, 7]))
+    .select("date_id", "full_date", "year", "month", "day", "dow", "is_weekend")
+    .orderBy("full_date")
+)
+
+dim_date.write.mode("overwrite").parquet(f"{GOLD}/dim_date")
+
+# -------------------------------------------------
+# dim_state
+# -------------------------------------------------
+dim_state = (
+    cases.select("state_code", "state_name")
+    .union(tests.select("state_code", "state_name"))
+    .filter(F.col("state_code").isNotNull())
+    .dropDuplicates(["state_code", "state_name"])
+    .orderBy("state_code")
+)
+
+dim_state.write.mode("overwrite").parquet(f"{GOLD}/dim_state")
+
+# -------------------------------------------------
+# fact_cases_state_daily
+# -------------------------------------------------
+w_cases = Window.partitionBy("state_code").orderBy("full_date")
+
+fact_cases = (
+    cases
+    .withColumn("date_id", F.date_format("full_date", "yyyyMMdd").cast("int"))
+    .withColumn("prev_cases_cum", F.lag("cases_cum").over(w_cases))
+    .withColumn("prev_deaths_cum", F.lag("deaths_cum").over(w_cases))
+    .withColumn(
+        "new_cases",
+        F.coalesce(
+            F.greatest(F.col("cases_cum") - F.col("prev_cases_cum"), F.lit(0)),
+            F.lit(0)
+        ).cast("int")
+    )
+    .withColumn(
+        "new_deaths",
+        F.coalesce(
+            F.greatest(F.col("deaths_cum") - F.col("prev_deaths_cum"), F.lit(0)),
+            F.lit(0)
+        ).cast("int")
+    )
+    .select(
+        "date_id",
+        "state_code",
+        "cases_cum",
+        "deaths_cum",
+        "new_cases",
+        "new_deaths"
+    )
+)
+
+fact_cases.write.mode("overwrite").parquet(f"{GOLD}/fact_cases_state_daily")
+
+# -------------------------------------------------
+# fact_testing_state_daily
+# -------------------------------------------------
+w_tests = Window.partitionBy("state_code").orderBy("full_date")
+
+fact_tests = (
+    tests
+    .withColumn("date_id", F.date_format("full_date", "yyyyMMdd").cast("int"))
+    .withColumn("prev_tests_total_cum", F.lag("tests_total_cum").over(w_tests))
+    .withColumn(
+        "new_tests",
+        F.coalesce(
+            F.greatest(F.col("tests_total_cum") - F.col("prev_tests_total_cum"), F.lit(0)),
+            F.lit(0)
+        ).cast("int")
+    )
+    .withColumn(
+        "positivity_rate",
+        F.when(
+            F.col("tests_total_cum") > 0,
+            (F.col("tests_pos_cum") / F.col("tests_total_cum")).cast("double")
+        ).otherwise(F.lit(None).cast("double"))
+    )
+    .select(
+        "date_id",
+        "state_code",
+        "tests_total_cum",
+        "tests_pos_cum",
+        "tests_neg_cum",
+        "new_tests",
+        "positivity_rate"
+    )
+)
+
+fact_tests.write.mode("overwrite").parquet(f"{GOLD}/fact_testing_state_daily")
+
+print("Gold write complete.")
+
+print(f"dim_date count: {dim_date.count()}")
+print(f"dim_state count: {dim_state.count()}")
+print(f"fact_cases count: {fact_cases.count()}")
+print(f"fact_tests count: {fact_tests.count()}")
+
+dim_date.selectExpr("min(full_date) as min_date", "max(full_date) as max_date").show()
+dim_state.show(10, truncate=False)
+
+fact_cases.groupBy("state_code").count().orderBy(F.desc("count")).show(10, truncate=False)
+fact_tests.groupBy("state_code").count().orderBy(F.desc("count")).show(10, truncate=False)
+
+job.commit()
